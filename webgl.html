@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Kingdom RTS — WebGL vs Canvas sprite test (TEST ONLY)</title>
+<style>
+html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#3f7a34;font-family:sans-serif}
+#wrap{position:relative;width:100%;height:100%}
+canvas.game{position:absolute;left:0;top:0;width:100%;height:100%;display:block}
+#dock{position:absolute;left:8px;bottom:8px;z-index:10;background:rgba(0,0,0,.78);color:#fff;
+ font-size:10px;line-height:1.35;padding:6px 8px;border-radius:6px;max-width:380px}
+#dock button{font-size:11px;padding:5px 8px;margin:2px 2px 2px 0;border-radius:5px;border:0;background:#f2c94c;color:#111}
+#dock button.on{background:#7cfc8a}
+#dock button.small{background:#ddd}
+#hideBtn{position:absolute;left:8px;bottom:8px;z-index:11;display:none;background:#f2c94c;border:0;border-radius:6px;padding:7px 10px;font-size:12px}
+.note{color:#ffd;opacity:.85}
+</style></head><body>
+<div id="wrap">
+<canvas id="cv2d" class="game"></canvas>
+<canvas id="gl" class="game" style="display:none"></canvas>
+<button id="hideBtn" onclick="showDock()">Show perf</button>
+<div id="dock">
+<div><b>TEST ONLY — NOT FOR FRIENDS, v1.8.26 WebGL prototype</b></div>
+<div id="nums">loading…</div>
+<div>
+<button id="bCanvas" class="on" onclick="setMode('canvas')">Canvas2D</button>
+<button id="bGl" onclick="setMode('webgl')">WebGL</button>
+<button onclick="setCount(100)">100 units</button>
+<button onclick="setCount(300)">300 units</button>
+<button onclick="setCount(600)">600 units</button>
+<button onclick="setDpr(1)">DPR 1x</button>
+<button onclick="setDpr(2)">DPR 2x</button>
+</div>
+<div>
+<button class="small" onclick="toggleMove()">Move: <span id="moveTxt">ON</span></button>
+<button class="small" onclick="hideDock()">Hide perf</button>
+</div>
+<div class="note">Equivalent detailed sprites, NOT extracted game art (see report). Same 104px sprites, same pile-up, both methods. Background is flat grass in both — this measures sprite compositing only, not terrain chunks, fog, particles or arrows.</div>
+<div class="note" id="offline"></div>
+</div></div>
+<script>
+'use strict';
+// ---- Equivalent detailed sprites (procedural, same size/complexity class as the game) ----
+// Game facts used: unit blit is 52x52 world px (render.js drawUnit); on a phone at DPR capped 2
+// the sprite bucket sc=2, so the cached sprite is ~104 device px. High uses 12 frames / 4 angles
+// in the real game; here we bake 2 teams x 4 angles x 6 frames = 48 sprites at 104x104, each with
+// body, shield+boss, helmet, head, legs, shading gradient and a baked soft shadow blob.
+var SPR=104, TEAMS=['#3b6fd4','#d43b3b'];
+function makeSprite(team,ang,fr){
+  var c=document.createElement('canvas'); c.width=c.height=SPR; var x=c.getContext('2d');
+  var cx=52, cy=56;
+  // baked soft shadow blob (game bakes soft shadows into sprites on High)
+  var g=x.createRadialGradient(cx,cy+34,4,cx,cy+34,26); g.addColorStop(0,'rgba(0,0,0,0.35)'); g.addColorStop(1,'rgba(0,0,0,0)');
+  x.fillStyle=g; x.beginPath(); x.ellipse(cx,cy+34,26,9,0,0,Math.PI*2); x.fill();
+  var legSwing=(fr%6-2.5)*3, bodyLean=Math.sin(ang)*3;
+  // legs
+  x.fillStyle='#4a3520'; x.fillRect(cx-9+legSwing,cy+10,7,22); x.fillRect(cx+2-legSwing,cy+10,7,22);
+  // body tunic, with shading gradient (the "shading" part)
+  var bg=x.createLinearGradient(cx-12,cy-14,cx+12,cy+14);
+  bg.addColorStop(0,'#ffffff'); bg.addColorStop(0.35,TEAMS[team]); bg.addColorStop(1,'#1a2a4a');
+  x.fillStyle=bg; x.fillRect(cx-11+bodyLean,cy-14,22,26);
+  // shield: team colour, boss dot, rim (like the game's shield boss detail)
+  x.fillStyle=TEAMS[team]; x.beginPath(); x.ellipse(cx+ (ang>1?-14:14), cy-2, 9, 13, 0, 0, Math.PI*2); x.fill();
+  x.strokeStyle='#e8dcb8'; x.lineWidth=2; x.stroke();
+  x.fillStyle='#e8dcb8'; x.beginPath(); x.arc(cx+(ang>1?-14:14), cy-2, 3, 0, Math.PI*2); x.fill();
+  // head + helmet
+  x.fillStyle='#e8c39a'; x.beginPath(); x.arc(cx,cy-20,8,0,Math.PI*2); x.fill();
+  x.fillStyle='#8a8f96'; x.beginPath(); x.arc(cx,cy-22,9,Math.PI,0); x.fill();
+  x.fillRect(cx-9,cy-24,18,4);
+  // spear / sword line, varies with frame (animation)
+  x.strokeStyle='#5a4630'; x.lineWidth=3; x.beginPath();
+  x.moveTo(cx+10,cy-28+fr); x.lineTo(cx+14,cy+12); x.stroke();
+  return c;
+}
+var sprites=[];
+for(var t=0;t<2;t++) for(var a=0;a<4;a++) for(var f=0;f<6;f++) sprites.push(makeSprite(t,a,f));
+// atlas for WebGL: 8 columns x 6 rows of 104px = 832x624
+var atlas=document.createElement('canvas'); atlas.width=832; atlas.height=624;
+var ax=atlas.getContext('2d');
+sprites.forEach(function(s,i){ ax.drawImage(s,(i%8)*104,Math.floor(i/8)*104); });
+
+// ---- Units: a battle pile-up, like the user's Sandbox battles ----
+var units=[], COUNT=300, MOVING=true, DPRMODE=2;
+function restage(){
+  units=[];
+  for(var i=0;i<COUNT;i++){
+    var side=i%2, cluster=side? 0.62:0.38;
+    units.push({x:(cluster+(Math.random()-0.5)*0.30), y:(0.45+(Math.random()-0.5)*0.30),
+      team:side, ang:Math.floor(Math.random()*4), ph:Math.random()*6, vx:(side? -0.012:0.012), vy:(Math.random()-0.5)*0.004});
+  }
+}
+restage();
+// ---- Canvas2D ----
+var cv=document.getElementById('cv2d'), ctx=cv.getContext('2d');
+var glc=document.getElementById('gl'), gl=null, glProg=null, glBuf=null, glTex=null;
+function resize(){
+  var w=window.innerWidth, h=window.innerHeight, dpr=Math.min(DPRMODE, window.devicePixelRatio||1);
+  [cv,glc].forEach(function(c){ c.width=Math.round(w*dpr); c.height=Math.round(h*dpr); });
+  if(gl) gl.viewport(0,0,glc.width,glc.height);
+  return {w:w,h:h,dpr:dpr};
+}
+var size=resize(); window.addEventListener('resize',function(){ size=resize(); });
+function initGL(){
+  try{ gl=glc.getContext('webgl',{alpha:false,antialias:false,powerPreference:'high-performance'})||glc.getContext('experimental-webgl'); }catch(e){ gl=null; }
+  if(!gl) return false;
+  var vs='attribute vec2 aPos; attribute vec2 aUv; varying vec2 vUv; uniform vec2 uRes; void main(){ vUv=aUv; vec2 p=(aPos/uRes)*2.0-1.0; gl_Position=vec4(p.x,-p.y,0.0,1.0); }';
+  var fs='precision mediump float; varying vec2 vUv; uniform sampler2D uTex; void main(){ vec4 c=texture2D(uTex,vUv); if(c.a<0.05) discard; gl_FragColor=c; }';
+  function sh(type,src){ var s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s); return s; }
+  var p=gl.createProgram(); gl.attachShader(p,sh(gl.VERTEX_SHADER,vs)); gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs)); gl.linkProgram(p); gl.useProgram(p); glProg=p;
+  glBuf=gl.createBuffer();
+  glTex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,glTex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,atlas);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+  return true;
+}
+var glOK=initGL();
+if(!glOK) document.getElementById('offline').textContent='WebGL not available in this browser — Canvas2D only.';
+var mode='canvas';
+function setMode(m){
+  mode=m;
+  document.getElementById('bCanvas').className=(m==='canvas'?'on':'');
+  document.getElementById('bGl').className=(m==='webgl'?'on':'');
+  cv.style.display=(m==='canvas'?'block':'none'); glc.style.display=(m==='webgl'?'block':'none');
+  if(m==='webgl' && !glOK){ alert('WebGL not available in this browser'); setMode('canvas'); }
+}
+function setCount(n){ COUNT=n; restage(); }
+function setDpr(d){ DPRMODE=d; size=resize(); }
+function toggleMove(){ MOVING=!MOVING; document.getElementById('moveTxt').textContent=MOVING?'ON':'OFF'; }
+function hideDock(){ document.getElementById('dock').style.display='none'; document.getElementById('hideBtn').style.display='block'; }
+function showDock(){ document.getElementById('dock').style.display='block'; document.getElementById('hideBtn').style.display='none'; }
+// ---- Frame loop, with the same style of numbers as the perf overlay ----
+var last=performance.now(), frameAvg=16.7, drawAvg=0, frameCount=0;
+var verts=new Float32Array(600*6*4); // max 600 units, 6 verts, x,y,u,v
+function loop(now){
+  var frameMs=now-last; last=now;
+  frameAvg=frameAvg*0.95+frameMs*0.05;
+  var t=now/1000;
+  if(MOVING) units.forEach(function(u){ u.x+=u.vx*0.016; u.y+=u.vy*0.016; if(u.x<0.05||u.x>0.95) u.vx*=-1; });
+  var w=size.w, h=size.h, dpr=size.dpr, draw0=performance.now(), drawMs=0;
+  if(mode==='canvas'){
+    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.fillStyle='#3f7a34'; ctx.fillRect(0,0,w,h);
+    // one ground shadow ellipse per unit in the real game is drawn before the sprite;
+    // here it is baked into the sprite, so Canvas does one drawImage per unit, like the game.
+    for(var i=0;i<units.length;i++){
+      var u=units[i], fr=Math.floor((t*8+u.ph))%6, idx=(u.team*4+u.ang)*6+fr;
+      var px=u.x*w-26, py=u.y*h-26;
+      ctx.drawImage(sprites[idx],px,py,52,52);
+    }
+  } else if(gl){
+    gl.viewport(0,0,glc.width,glc.height); gl.clearColor(0.25,0.48,0.20,1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(glProg);
+    var resLoc=gl.getUniformLocation(glProg,'uRes'); gl.uniform2f(resLoc,glc.width,glc.height);
+    var posLoc=gl.getAttribLocation(glProg,'aPos'), uvLoc=gl.getAttribLocation(glProg,'aUv');
+    var n=units.length, vi=0;
+    for(var j=0;j<n;j++){
+      var u2=units[j], fr2=Math.floor((t*8+u2.ph))%6, idx2=(u2.team*4+u2.ang)*6+fr2;
+      var sx=(idx2%8)/8, sy=Math.floor(idx2/8)/6, uw=1/8, uh=1/6;
+      var x0=u2.x*w*dpr-26*dpr, y0=u2.y*h*dpr-26*dpr, x1=x0+52*dpr, y1=y0+52*dpr;
+      // two triangles per quad, x,y,u,v
+      var q=[[x0,y0,sx,sy],[x1,y0,sx+uw,sy],[x1,y1,sx+uw,sy+uh],[x0,y0,sx,sy],[x1,y1,sx+uw,sy+uh],[x0,y1,sx,sy+uh]];
+      for(var k=0;k<6;k++){ verts[vi++]=q[k][0]; verts[vi++]=q[k][1]; verts[vi++]=q[k][2]; verts[vi++]=q[k][3]; }
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER,glBuf); gl.bufferData(gl.ARRAY_BUFFER,verts.subarray(0,n*24),gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(posLoc); gl.vertexAttribPointer(posLoc,2,gl.FLOAT,false,16,0);
+    gl.enableVertexAttribArray(uvLoc); gl.vertexAttribPointer(uvLoc,2,gl.FLOAT,false,16,8);
+    gl.drawArrays(gl.TRIANGLES,0,n*6);
+  }
+  drawMs=performance.now()-draw0; drawAvg=drawAvg*0.95+drawMs*0.05;
+  var gap=Math.max(0,frameAvg-drawAvg);
+  if(++frameCount%5===0){
+    document.getElementById('nums').innerHTML=
+      'frame '+(frameAvg).toFixed(1)+' ms ('+Math.round(1000/frameAvg)+' fps) &nbsp; draw '+(drawAvg).toFixed(1)+' ms &nbsp; gap '+(gap).toFixed(1)+' ms<br>'+
+      'units '+units.length+' &nbsp; method '+(mode==='canvas'?'Canvas2D':'WebGL batched')+' &nbsp; dpr '+(window.devicePixelRatio||1)+' (capped '+dpr+') &nbsp; canvas '+glc.width+'x'+glc.height+' &nbsp; sprites 104px, 48 variants';
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script></body></html>
